@@ -1,0 +1,11 @@
+﻿{
+  "bindings": [
+    {
+      "name": "mySbMsg",
+      "type": "serviceBusTrigger",
+      "direction": "in",
+      "queueName": "supporttickets",
+      "connection": "basfsevatest_RootManageSharedAccessKey_SERVICEBUS"
+    }
+  ]
+}

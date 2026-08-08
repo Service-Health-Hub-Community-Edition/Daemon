@@ -1,0 +1,8 @@
+class BaseNotification
+{
+
+    BaseNotification()
+    {
+        
+    }
+}
