@@ -19,7 +19,6 @@ Automatically imports and processes:
 - Azure Updates
 - Dynamics 365 Release Planner communications
 - Power Platform Release Planner communications
-- Service Health Hub release announcements
 
 ### Near Real-Time Notifications
 
