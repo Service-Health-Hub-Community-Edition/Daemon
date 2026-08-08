@@ -1,0 +1,613 @@
+using module ..\AuthManager.psm1
+using module ..\AuthManagerHelper.psm1
+using module ..\Logging.psm1
+using module ..\ConfigurationManager.psm1
+using module ..\M365ServiceHealthHubDB.psm1
+using module ..\NameValuePair.psm1
+
+class Principal {
+    [string]$Id
+    [string]$Type
+
+    Principal(
+        [string]$Id,
+        [string]$Type
+    ) {
+        $this.Id = $Id;
+        $this.Type = $Type;
+    }
+}
+
+class Acl {
+    [string]$type
+    [string]$value
+    [string]$accessType
+
+    Acl(
+        [string]$Type,
+        [string]$Value,
+        [string]$AccessType
+    ) {
+        $this.type = $Type;
+        $this.value = $Value;
+        $this.accessType = $AccessType;
+    }
+
+    [bool]Equals([object]$obj) {
+        if ($null -eq $obj -or $this.GetType() -ne $obj.GetType()) {
+            return $false
+        }
+
+        $other = [Acl]$obj
+        return $($this.type -eq $other.type) -and $($this.value -eq $other.value) -and $($this.accessType -eq $other.accessType)
+    }
+
+    [int]GetHashCode() {
+        return $this.type.GetHashCode() -bxor $this.value.GetHashCode() -bxor $this.accessType.GetHashCode()
+    }
+}
+
+class IndexResponse {
+    [bool]$Success
+    [object]$Response
+    [object]$Payload
+}
+
+class GraphConnector {
+    [M365ServiceHealthHubDB]$m_db = [M365ServiceHealthHubDB]::new();
+    [AuthManager]$AuthManager = $null;
+    [bool]$Enabled = $false;
+    [bool]$Ready = $false;
+    [string] $ConnectorId = "mscommshub";
+    [string] $ConnectorEndpoint = "https://graph.microsoft.com/v1.0/external/connections/$($this.ConnectorId)";
+    [string] $RootUrl = "";
+    [object] $Connector = $null;
+    [object] $ServiceHealthHubConnector = $null;
+    [System.Collections.Generic.List[Acl]]$AccessControlList = [System.Collections.Generic.List[Acl]]::new();
+    [string[]] $AllowedRoles = @(
+        "Communication.Write.All",
+        "ServiceHealthReader",
+        "Admin"
+    )
+
+    GraphConnector() {
+        # retrieve connector configuration from the database
+        $this.ServiceHealthHubConnector = $this.GetSearchConnector();
+
+        $authConfigKey = [string]::IsNullOrWhiteSpace([ConfigurationManager]::CopilotConnectorAuthConfig) ? 
+                            [ConfigurationManager]::GraphApiAuthConfig : [ConfigurationManager]::CopilotConnectorAuthConfig;
+                            
+        if ([string]::IsNullOrWhiteSpace($authConfigKey))
+        {
+            $this.AuthManager = [AuthManagerHelper]::CreateInstance("https://graph.microsoft.com");
+        } else {
+            $authConfigJson = [ConfigurationManager]::GetSecret($authConfigKey);
+            $authConfig = ConvertFrom-Json $authConfigJson
+            $this.AuthManager = [AuthManager]::new(
+                $authConfig.ClientId,
+                $authConfig.ClientSecret,
+                $authConfig.TenantDomain,
+                "https://graph.microsoft.com")
+        }
+
+        if ($($($this.ServiceHealthHubConnector | Where-Object name -eq "Enabled").value -eq $true)) {
+            if ($null -eq $this.AuthManager) {
+                $errorMsg = "Authentication manager is currently unavailable.";
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "Initialization", "gm018", $errorMsg);
+                throw $errorMsg
+            }
+
+            if (!$this.CheckRoles()) {
+                $decodedToken = $this.AuthManager.DecodeToken();
+                $errorMsg = "App registration doesn't have required API permissions. Please add ExternalItem.ReadWrite.OwnedBy or ExternalItem.ReadWrite.All permission to the App registration '$($decodedToken.Payload.app_displayname)' [App Id: $($decodedToken.Payload.appid)] and try again.";
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "Initialization", "gm021", $errorMsg);
+                throw $errorMsg
+            }
+
+            $this.Connector = $this.GetConnector();
+            $this.Ready = $($this.Connector.state -eq "ready");
+        
+            $this.Enabled = $($null -ne $this.Connector) -and $($($this.ServiceHealthHubConnector | Where-Object name -eq "Enabled").value -eq $true);
+
+            if ([string]::IsNullOrWhiteSpace([ConfigurationManager]::WebAppId)) {
+                $this.AccessControlList = $this.GetAcls();
+            }
+            else {
+                $this.AccessControlList = $this.GetAcls([ConfigurationManager]::WebAppId);
+            }
+        }
+        else {
+            $this.Enabled = $false;
+        }
+    }
+
+    [bool]CheckRoles() {
+        [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "CheckRoles", "gm042", "Validating permissions.");
+        $requiredRolesAvailable = $false;
+        $decodedToken = $this.AuthManager.DecodeToken();
+        $decodedToken.Payload.roles | Foreach-Object { $requiredRolesAvailable = $requiredRolesAvailable -or ($_ -in @("ExternalItem.ReadWrite.OwnedBy", "ExternalItem.ReadWrite.All")) }
+        [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "CheckRoles", "gm043", "Required roles available: $requiredRolesAvailable.");
+        return $requiredRolesAvailable;
+    }
+
+    [object]GetConnector() {
+        [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "GetConnector", "gm052", "Retrieving Graph connector.");
+
+        $conn = $null
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method GET -Uri $this.ConnectorEndpoint -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 200) {
+            $conn = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "GetConnector", "gm053", "Connector retrieved: $($conn.name). Connector state: $($conn.state)");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "GetConnector", "gm053", "Retrieving connector failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+        
+        return $conn;
+    }
+
+    [System.Collections.Generic.List[NameValuePair]]GetSearchConnector() {
+        $conn = $this.m_db.GetConnector("a6a162f4-4910-4c64-a5fd-18a01665c88d");
+        if ($null -eq $conn) {
+            return $null
+        }
+        else {
+            $config = ConvertFrom-Json -InputObject $conn.Configuration;
+            $configList = [System.Collections.Generic.List[NameValuePair]]::new()
+            $config | ForEach-Object {
+                if ($_.name -eq "SyncACL") {
+                    $acl = [System.Collections.Generic.List[Acl]]::new()
+                    foreach ($aclItem in $_.value) {
+                        $acl.Add([Acl]::new($aclItem.type, $aclItem.value, $aclItem.accessType))
+                    }
+                    $configList.Add([NameValuePair]::new($_.name, $acl))
+                }
+                else {
+                    $configList.Add([NameValuePair]::new($_.name, $_.value))
+                }
+            }
+            return $configList;
+        }
+    }
+
+    [void]SetSearchConnector() {
+        $conn = $this.m_db.GetConnector("a6a162f4-4910-4c64-a5fd-18a01665c88d");
+        if ($null -eq $conn) {
+            throw "Graph Connector not found"
+        }
+        else {
+            $conn.Configuration = $(ConvertTo-Json -InputObject $this.ServiceHealthHubConnector -Depth 5)
+            $this.m_db.AddConnector($conn); # it will update connector, if it exists
+        }
+    }
+
+    [void]SetSearchConnectorConfigurationValue(
+        [string]$Name,
+        [object]$Value
+    ) {
+        $object = $this.ServiceHealthHubConnector | Where-Object Name -eq $Name
+        if ($null -eq $object) {
+            $this.ServiceHealthHubConnector.Add([NameValuePair]::new($Name, $Value))
+        }
+        else {
+            $object.value = $Value
+        }
+    }
+
+    [void]CopyPermissionsToCache() {
+        $acl = [System.Collections.Generic.List[Acl]]::new();
+        foreach ($accessControlItem in $this.AccessControlList) {
+            $acl.Add([Acl]::new($accessControlItem.type, $accessControlItem.value, $accessControlItem.accessType))
+        }
+        $this.SetSearchConnectorConfigurationValue("SyncACL", $acl)
+    }
+
+    [bool]PermissionsChanged() {
+        $aclsUnchanged = $true
+
+        $syncACL = $this.ServiceHealthHubConnector | Where-Object name -eq "SyncACL"
+        if ($null -eq $syncACL) {
+            $aclsUnchanged = $false
+        }
+        else {
+            $cachedACLs = $syncACL.value
+            $cachedACLs | ForEach-Object { $aclsUnchanged = $aclsUnchanged -and $($_ -in $this.AccessControlList) }
+            $this.AccessControlList | ForEach-Object { $aclsUnchanged = $aclsUnchanged -and $($_ -in $cachedACLs) }
+        }
+
+        return -not $aclsUnchanged
+    }
+
+    [void]ResetIndexFlag() {
+        $this.m_db.ResetIndexFlag()
+        # to be implemented - reset index flag on all items in the database and retrigger indexing
+        # add expiration to the Search schema:
+        # - Message Center post - endDateTime + 2 months
+        # - Service Health - endDateTime + 2 months
+        # - Roadmap - General Availability + 2 months or Last Update + 2 years
+        # - Azure Updates - Last Update + 2 years
+        # - Azure Service Health Alert - End date time + 2 months
+        # - Dynamics 365 and Power Platform Release - GA date + 2 months or Last Update + 2 years
+        # 2 jobs will be implemented - Full index (fix permissions, if required), Index cleanup (remove expired items)
+    }
+
+    [System.Collections.Generic.List[string]]GetAppRoles(
+        [string]$AppId
+    ) {
+        $url = "https://graph.microsoft.com/v1.0/servicePrincipals/$AppId/appRoles"
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method GET -Uri $url -Headers @{ Authorization = "Bearer $($token.access_token)" } -SkipHttpErrorCheck
+
+        $roleIds = [System.Collections.Generic.List[string]]::new();
+        if ($res.StatusCode -eq 200) {
+            $resObjCollection = $(ConvertFrom-Json $res.Content)
+            foreach ($resObj in $resObjCollection.value) {
+                if ($resObj.value -in $this.AllowedRoles) {
+                    $roleIds.Add($resObj.id);
+                }
+            }
+        }
+
+        return $roleIds
+    }
+
+    [System.Collections.Generic.List[Principal]]GetAppRoleAssignment(
+        [string]$AppId
+    ) {
+        $roleIds = $this.GetAppRoles($AppId);
+        $resObj = [System.Collections.Generic.List[Principal]]::new();
+
+        if ($roleIds.Count -gt 0) {
+            $url = "https://graph.microsoft.com/v1.0/servicePrincipals/$AppId/appRoleAssignedTo"
+
+            $token = $this.AuthManager.GetAuthToken();
+            $res = Invoke-WebRequest -Method GET -Uri $url -Headers @{ Authorization = "Bearer $($token.access_token)" } -SkipHttpErrorCheck
+            
+            if ($res.StatusCode -eq 200) {
+                $responseObjCollection = $(ConvertFrom-Json $res.Content)
+                foreach ($responseObj in $responseObjCollection.value) {
+                    if ($responseObj.appRoleId -in $roleIds) {
+                        $existingRecord = $resObj | Where-Object Id -eq $responseObj.principalId;
+                        if ($null -eq $existingRecord) {
+                            $principal = [Principal]::new($responseObj.principalId, $responseObj.principalType)
+                            $resObj.Add($principal);
+                        }
+                    }
+                }
+            }
+        }
+
+        return $resObj
+    }
+
+    [System.Collections.Generic.List[Acl]]GetAcls() {
+        $decodedToken = $this.AuthManager.DecodeToken()
+        return $this.GetAcls($decodedToken.Payload.appid)
+    }
+
+    [System.Collections.Generic.List[Acl]]GetAcls(
+        [string]$ObjectId
+    ) {
+        $allowedPrincipalTypes = @(
+            "User",
+            "Group"
+        );
+
+        $acl = [System.Collections.Generic.List[Acl]]::new();
+        $principals = $this.GetAppRoleAssignment($ObjectId);
+
+        foreach ($principal in $principals) {
+            if ($principal.Type -in $allowedPrincipalTypes) {
+                $ac = [Acl]::new($principal.Type.ToLower(), $principal.Id, "grant");
+                $acl.Add($ac);
+            }  
+        }
+
+        return $acl;
+    }
+
+    [IndexResponse]IndexItem(
+        [string]$Id,
+        [string]$Title,
+        [string]$Source,
+        [string]$Summary,
+        [string]$Status,
+        [DateTime]$ExpirationDate,
+        [string[]]$Resources,
+        [DateTime]$StartTime,
+        [DateTime]$EndTime,
+        [DateTime]$LastUpdate,
+        [string[]]$Tags,
+        [string]$Url,
+        [string]$Content,
+        [string]$contentType
+    ) {
+        $responseObject = [IndexResponse]::new();
+        if ($this.Enabled -eq $false) {
+            $errorMsg = "Graph connector is not enabled. Indexing item will be skipped.";
+            [TraceLogging]::LogEvent([LoggingLevel]::Information, "GraphManager", "Index", "gm0a0", $errorMsg);
+            $responseObject.Success = $false
+            $responseObject.Response = @{ 
+                Content = $errorMsg
+                StatusCode = 405
+                StatusDescription = "Method Not Allowed"
+            }
+            $responseObject.Payload = $null
+        }
+        else {
+            $iconUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAAE9mlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgOS4xLWMwMDIgNzkuYTZhNjM5NjhhLCAyMDI0LzAzLzA2LTExOjUyOjA1ICAgICAgICAiPiA8cmRmOlJERiB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiPiA8cmRmOkRlc2NyaXB0aW9uIHJkZjphYm91dD0iIiB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC8iIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIgeG1sbnM6cGhvdG9zaG9wPSJodHRwOi8vbnMuYWRvYmUuY29tL3Bob3Rvc2hvcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyIgeG1wOkNyZWF0b3JUb29sPSJBZG9iZSBQaG90b3Nob3AgMjUuMTEgKE1hY2ludG9zaCkiIHhtcDpDcmVhdGVEYXRlPSIyMDI0LTA5LTA2VDEyOjM3OjM0KzAyOjAwIiB4bXA6TW9kaWZ5RGF0ZT0iMjAyNC0wOS0wNlQxMjo0MjoxMSswMjowMCIgeG1wOk1ldGFkYXRhRGF0ZT0iMjAyNC0wOS0wNlQxMjo0MjoxMSswMjowMCIgZGM6Zm9ybWF0PSJpbWFnZS9wbmciIHBob3Rvc2hvcDpDb2xvck1vZGU9IjMiIHhtcE1NOkluc3RhbmNlSUQ9InhtcC5paWQ6MjhjZGQxMGYtMWViOS00NTQ5LWJiNTMtODFjOTE3MThhNzU4IiB4bXBNTTpEb2N1bWVudElEPSJ4bXAuZGlkOjI4Y2RkMTBmLTFlYjktNDU0OS1iYjUzLTgxYzkxNzE4YTc1OCIgeG1wTU06T3JpZ2luYWxEb2N1bWVudElEPSJ4bXAuZGlkOjI4Y2RkMTBmLTFlYjktNDU0OS1iYjUzLTgxYzkxNzE4YTc1OCI+IDx4bXBNTTpIaXN0b3J5PiA8cmRmOlNlcT4gPHJkZjpsaSBzdEV2dDphY3Rpb249ImNyZWF0ZWQiIHN0RXZ0Omluc3RhbmNlSUQ9InhtcC5paWQ6MjhjZGQxMGYtMWViOS00NTQ5LWJiNTMtODFjOTE3MThhNzU4IiBzdEV2dDp3aGVuPSIyMDI0LTA5LTA2VDEyOjM3OjM0KzAyOjAwIiBzdEV2dDpzb2Z0d2FyZUFnZW50PSJBZG9iZSBQaG90b3Nob3AgMjUuMTEgKE1hY2ludG9zaCkiLz4gPC9yZGY6U2VxPiA8L3htcE1NOkhpc3Rvcnk+IDwvcmRmOkRlc2NyaXB0aW9uPiA8L3JkZjpSREY+IDwveDp4bXBtZXRhPiA8P3hwYWNrZXQgZW5kPSJyIj8+tEc1XQAAAixJREFUWMPtl8srRFEcx8eCjTTMsFDKxkJJzGoWNqxspNjY2lj4D7CytCJ5JJGQLrKwVFMkhQWmLOSxGGUjj5LXeF/fn75T1+3cO/eeMJTFpzvn8bu/7/md37m/MwHTNAOZJPDnBBiGUQ6WwQOIg05Q+iMC4CgHHIJT0AvWwBuR3+2gkHNbwD64BaMgz5MAmQgmwQ0wbTzy2WSZX8oo7HLsCWyDVz4nwAtYB0EvAqZoMA16bGyAc5DtEKFK2j+DTZDL/maK3wKhdALuwJyiP5/7PuCyRVXgitEosI01WPKmyE2AhHFY0d/GsaiD8zJwBk5AicOcei5wDxT7FbAKDhxeXASOKKAiTSLXMTEPRKh0hMECk8f0gcyfZxLGubKox9NUA67BojRmmSAjiqRzY5R2x3w2+jzSfSJCfiSlofFBygJDPqOWQhL1AiRSe95heXE3aFU4bJUxW18X7Xt8Mk+7DZUAaa8oBKzImK2vw7oyi72XviWJfiYFfNj+WgEJ5oKVhJMAnSqYToAjOhHQEfClW/BrBPCrGwPVXyrA456H+ck2KeJ7IsD+CJ2EFM7jbDsKqJUQKQRI2Go9CojxmrbDMv3JuWsO6BwlhYAwnb+x6n1ybhdwD/o1BQxKGXYYC1GEOL+0OrcLMFjbx3wWlHHazbgIDHE7Im7HUO56c4yEn5J6x7tEUDN6Qx/FSDGQisi4Rpn1Gz1DJSDIlSU1LxteSDLqwcD/n9NMC3gH+DphDKIJ8XAAAAAASUVORK5CYII="
+            $itemBody = @{
+                acl        = $this.AccessControlList
+                properties = @{
+                    id                     = $Id
+                    title                  = $Title
+                    source                 = $Source
+                    summary                = $Summary
+                    content                = $Content
+                    "resources@odata.type" = "Collection(String)"
+                    resources              = $Resources
+                    startTime              = $StartTime.ToString("s")
+                    endTime                = $EndTime.ToString("s")
+                    lastUpdate             = $LastUpdate.ToString("s")
+                    expirationDate         = $ExpirationDate.ToString("s")
+                    status                 = $Status
+                    "tags@odata.type"      = "Collection(String)"
+                    tags                   = $Tags
+                    url                    = $Url
+                    iconUrl                = $iconUrl
+                }
+                content    = @{
+                    value = $Content
+                    type  = $ContentType
+                }
+            }
+        
+            $token = $this.AuthManager.GetAuthToken();
+            $itemRes = Invoke-WebRequest -Method PUT -URI "$($this.ConnectorEndpoint)/items/$Id" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json; charset=utf-8" } -Body $(ConvertTo-Json $itemBody -Depth 10) -SkipHttpErrorCheck
+            
+            if ($itemRes.StatusCode -eq 200) {
+                $responseObject.Success = $true
+                $responseObject.Response = $(ConvertFrom-Json $itemRes.Content)
+                $responseObject.Payload = $null
+            
+                $this.m_db.RegisterIndexEvent($Id);
+            }
+            else {
+                $responseObject.Success = $false
+                $responseObject.Response = $($itemRes | Select-Object Content, Encoding, Headers, Images, InputFields, Links, RelationLink, StatusCode, StatusDescription)
+                $responseObject.Payload = $(ConvertTo-Json $itemBody -Depth 10)
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "Index", "gm0a1", "Couldn't index item. HTTP status code: $($itemRes.StatusCode). Message: $($responseObject.Response.Content).");
+            
+            }
+        }
+
+        return $responseObject;
+    }
+
+    [void]DeleteItem(
+        [string]$Id
+    ) {
+        if ($this.Enabled -eq $false) {
+            $errorMsg = "Graph connector is not enabled. Deleting item will be skipped.";
+            [TraceLogging]::LogEvent([LoggingLevel]::Information, "GraphManager", "Delete", "gm0b0", $errorMsg);
+            return;
+        }
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method DELETE -Uri "$($this.ConnectorEndpoint)/items/$Id" -Headers @{ Authorization = "Bearer $($token.access_token)" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 204) {
+            [TraceLogging]::LogEvent([LoggingLevel]::Information, "GraphManager", "Delete", "gm0b1", "Item with ID '$Id' deleted successfully.");
+            $this.m_db.SetIndexFlag($Id, 0);
+        }
+        else {
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "Delete", "gm0b2", "Couldn't delete item with ID '$Id'. HTTP status code: $($res.StatusCode). Message: $($res.Content).");
+        }
+    }
+
+    [string]GetRootUrl() {
+        return $($this.ServiceHealthHubConnector | Where-Object name -eq "RootUrl").Value
+    }
+
+    [System.Object]GetCachedACLs() {
+        return $($this.ServiceHealthHubConnector | Where-Object name -eq "SyncACL").Value
+    }
+
+    [object]GetGroup(
+        [string]$GroupId
+    ) {
+        $group = $null
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method GET -Uri "$($this.ConnectorEndpoint)/groups/$GroupId" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 200) {
+            $group = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "GetGroup", "gm0c1", "Group retrieved: $($group.displayName) [ID: $($group.id)].");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "GetGroup", "gm0c2", "Retrieving group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+        
+        return $group;
+    }
+
+    [object]CreateGroup(
+        [string]$GroupId,
+        [string]$DisplayName,
+        [string]$Description
+    ) {
+        $group = $this.GetGroup($GroupId);
+        if ($null -ne $group) {
+            return $group;
+        }
+
+        $groupBody = @{
+            id = $GroupId
+            displayName = $DisplayName
+            description = $Description
+        }
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method POST -Uri "$($this.ConnectorEndpoint)/groups" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -Body $(ConvertTo-Json $groupBody -Depth 10) -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 200) {
+            $group = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "CreateGroup", "gm0d1", "Group created: $($group.displayName) [ID: $($group.id)].");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "CreateGroup", "gm0d2", "Creating group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+        
+        return $group;
+    }
+
+    [object]UpdateGroup(
+        [string]$GroupId,
+        [string]$DisplayName,
+        [string]$Description
+    ) {
+        $group = $this.GetGroup($GroupId);
+        if ($null -ne $group) {
+            $groupBody = @{
+                displayName = $DisplayName
+                description = $Description
+            }
+
+            $token = $this.AuthManager.GetAuthToken();
+            $res = Invoke-WebRequest -Method PATCH -Uri "$($this.ConnectorEndpoint)/groups/$GroupId" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -Body $(ConvertTo-Json $groupBody -Depth 10) -SkipHttpErrorCheck
+
+            if ($res.StatusCode -eq 204) {
+                $group = $(ConvertFrom-Json $res.Content);
+                [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "UpdateGroup", "gm0d1", "Group updated: $($group.displayName) [ID: $($group.id)].");
+            }
+            else {
+                $responseObject = $(ConvertFrom-Json $res.Content);
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "UpdateGroup", "gm0d2", "Updating group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+            }
+            
+            return $group;
+        } else {
+            [TraceLogging]::LogEvent([LoggingLevel]::Information, "GraphManager", "UpdateGroup", "gm0d3", "Group with ID '$GroupId' doesn't exist. Creating new group.");
+            return $this.CreateGroup($GroupId, $DisplayName, $Description);
+        }  
+    }
+
+    [void]DeleteGroup(
+        [string]$GroupId
+    ) {
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method DELETE -Uri "$($this.ConnectorEndpoint)/groups/$GroupId" -Headers @{ Authorization = "Bearer $($token.access_token)" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 204) {
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "DeleteGroup", "gm0d1", "Group deleted: [ID: $GroupId].");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "DeleteGroup", "gm0d2", "Deleting group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+    }
+
+    [object]GetUserByEmail(
+        [string]$UserEmail
+    ) {
+        $user = $null
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users?`$filter=proxyAddresses/any(c:c eq 'SMTP:$UserEmail')" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 200) {
+            $resultObject = $(ConvertFrom-Json $res.Content);
+            $user = $resultObject.value[0];
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "GetUserByEmail", "gm0e1", "User retrieved: $($user.displayName) [ID: $($user.id)].");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "GetUserByEmail", "gm0e2", "Retrieving user failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+        
+        return $user;
+    }
+
+    [object]AddGroupMember(
+        [string]$GroupId,
+        [string]$MemberId,
+        [string]$MemberType
+    ) {
+        if ($MemberType -notin @("user", "group", "externalGroup")) {
+            $errorMsg = "Invalid member type '$MemberType'. Only 'user', 'group' and 'externalGroup' types are supported.";
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "AddGroupMember", "gm0f3", $errorMsg);
+            return $null;
+        }
+
+        $MemberUniqueId = $MemberId;
+        if ($MemberType.ToLower() -eq "user") {
+            $userObject = $this.GetUserByEmail($MemberId);
+            if ($null -ne $userObject) {
+                $MemberUniqueId = $userObject.id;
+            } else {
+                $errorMsg = "User with email '$MemberId' not found.";
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "AddGroupMember", "gm0f0", $errorMsg);
+                return $null;
+            }
+        }
+
+        $memberBody = @{
+            id = $MemberUniqueId
+            type = $MemberType
+        }
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method POST -Uri "$($this.ConnectorEndpoint)/groups/$GroupId/members/" -Headers @{ Authorization = "Bearer $($token.access_token)"; "Content-Type" = "application/json" } -Body $(ConvertTo-Json $memberBody -Depth 10) -SkipHttpErrorCheck
+
+        $memberObject = $null;
+        if ($res.StatusCode -eq 201) {
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "AddGroupMember", "gm0f1", "Member with ID '$MemberId' added to group with ID '$GroupId'.");
+            $memberObject = $(ConvertFrom-Json $res.Content);
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "AddGroupMember", "gm0f2", "Adding user to group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+        return $memberObject;
+    }
+
+    [void]RemoveGroupMember(
+        [string]$GroupId,
+        [string]$MemberId,
+        [string]$MemberType
+    ) {
+        if ($MemberType -notin @("user", "group", "externalGroup")) {
+            $errorMsg = "Invalid member type '$MemberType'. Only 'user', 'group' and 'externalGroup' types are supported.";
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "RemoveGroupMember", "gm0g3", $errorMsg);
+        }
+
+        $MemberUniqueId = $MemberId;
+        if ($MemberType.ToLower() -eq "user") {
+            $userObject = $this.GetUserByEmail($MemberId);
+            if ($null -ne $userObject) {
+                $MemberUniqueId = $userObject.id;
+            } else {
+                $errorMsg = "User with email '$MemberId' not found.";
+                [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "RemoveGroupMember", "gm0g0", $errorMsg);
+            }
+        }
+
+        $token = $this.AuthManager.GetAuthToken();
+        $res = Invoke-WebRequest -Method DELETE -Uri "$($this.ConnectorEndpoint)/groups/$GroupId/members/$MemberUniqueId" -Headers @{ Authorization = "Bearer $($token.access_token)" } -SkipHttpErrorCheck
+
+        if ($res.StatusCode -eq 204) {
+            [TraceLogging]::LogEvent([LoggingLevel]::Verbose, "GraphManager", "RemoveGroupMember", "gm0g1", "Member with ID '$MemberId' removed from group with ID '$GroupId'.");
+        }
+        else {
+            $responseObject = $(ConvertFrom-Json $res.Content);
+            [TraceLogging]::LogEvent([LoggingLevel]::Error, "GraphManager", "RemoveGroupMember", "gm0g2", "Removing member from group failed. HTTP status code: $($res.StatusCode). Error code: $($responseObject.error.code). Error message: $($responseObject.error.message)");
+        }
+    }
+}
